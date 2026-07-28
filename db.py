@@ -1,11 +1,15 @@
+import argparse
 import os
+import shutil
 import sqlite3
 from datetime import datetime, date, timedelta
 from pathlib import Path
+from typing import Union
 
 DB_PATH = Path(
     os.environ.get("STUDY_TRACKER_DB", Path(__file__).parent / "study_tracker.db")
 )
+BACKUPS_DIR = Path(__file__).parent / "backups"
 
 RESOURCE_TYPES = ["book", "course", "video", "article", "other"]
 RESOURCE_STATUSES = ["not started", "in progress", "completed"]
@@ -16,6 +20,57 @@ def get_connection():
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
+
+
+def _ensure_backups_dir() -> Path:
+    BACKUPS_DIR.mkdir(parents=True, exist_ok=True)
+    return BACKUPS_DIR
+
+
+def get_test_db_path(name: str = "test_study_tracker.db") -> Path:
+    """Return a database path safe for tests/experiments.
+
+    Tests should never touch the production database. Use this path (or any
+    custom path via the STUDY_TRACKER_DB environment variable) for isolated
+    test instances.
+    """
+    _ensure_backups_dir()
+    return BACKUPS_DIR / name
+
+
+def backup_db(label: str = "manual") -> Path:
+    """Create a timestamped backup of the current database."""
+    if not DB_PATH.exists():
+        raise FileNotFoundError(f"Database not found at {DB_PATH}; nothing to back up.")
+    _ensure_backups_dir()
+    timestamp = datetime.now().strftime("%Y-%m-%d-%H%M%S")
+    backup_name = f"{DB_PATH.stem}.{timestamp}.{label}.bak"
+    backup_path = BACKUPS_DIR / backup_name
+    shutil.copy2(DB_PATH, backup_path)
+    return backup_path
+
+
+def list_backups():
+    """Return available manual backups, most recent first."""
+    if not BACKUPS_DIR.exists():
+        return []
+    backups = BACKUPS_DIR.glob(f"{DB_PATH.stem}.*.bak")
+    return sorted(backups, key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def restore_db(backup_path: Union[str, Path], force: bool = False) -> Path:
+    """Restore the database from a backup file."""
+    backup_path = Path(backup_path)
+    if not backup_path.exists():
+        raise FileNotFoundError(f"Backup not found: {backup_path}")
+    if DB_PATH.exists() and not force:
+        raise FileExistsError(
+            f"Current database already exists at {DB_PATH}. "
+            "Use force=True or --force to overwrite it."
+        )
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(backup_path, DB_PATH)
+    return DB_PATH
 
 
 def init_db():
@@ -400,5 +455,34 @@ def get_hours_over_time(period: str = "daily", area_id: int = None):
 # -----------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    init_db()
-    print("Database initialized at", DB_PATH)
+    parser = argparse.ArgumentParser(description="Study Tracker database utilities")
+    parser.add_argument("--backup", action="store_true", help="Create a manual backup")
+    parser.add_argument(
+        "--list-backups", action="store_true", help="List available backups"
+    )
+    parser.add_argument(
+        "--restore", metavar="PATH", help="Restore database from a backup"
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite the existing database when restoring",
+    )
+    args = parser.parse_args()
+
+    if args.backup:
+        backup_path = backup_db()
+        print("Backup created:", backup_path)
+    elif args.list_backups:
+        backups = list_backups()
+        if not backups:
+            print("No backups found in", BACKUPS_DIR)
+        else:
+            for backup in backups:
+                print(backup)
+    elif args.restore:
+        restored_path = restore_db(args.restore, force=args.force)
+        print("Database restored to:", restored_path)
+    else:
+        init_db()
+        print("Database initialized at", DB_PATH)

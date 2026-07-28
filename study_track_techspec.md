@@ -53,8 +53,9 @@ A personal Streamlit + SQLite app to track study progress across resources (book
 ```
 study_tracker/
 ├── app.py                        # entry point / home page
-├── db.py                         # SQLite connection + schema init + CRUD functions
+├── db.py                         # SQLite connection + schema init + CRUD + backup functions
 ├── study_tracker.db              # created on first run (default location)
+├── backups/                      # manual database backups (gitignored)
 └── pages/
     ├── 1_Areas_of_Knowledge.py
     ├── 2_Resources.py
@@ -77,6 +78,50 @@ This is useful for:
 - Running isolated test instances without risking personal study data.
 
 If `STUDY_TRACKER_DB` is not set, the app falls back to the default `study_tracker.db` next to `app.py`.
+
+---
+
+## Database Backups
+
+The SQLite database contains personal study data. The app supports manual, timestamped backups so user data is never lost when changing app code or running tests.
+
+Backups are stored in the `backups/` directory next to `db.py`, with filenames like:
+
+```
+backups/study_tracker.YYYY-MM-DD-HHMMSS.manual.bak
+```
+
+### Manual backup CLI
+
+```bash
+# Create a backup of the current database
+python db.py --backup
+
+# List available backups
+python db.py --list-backups
+
+# Restore a backup (requires --force to overwrite an existing live DB)
+python db.py --restore backups/study_tracker.YYYY-MM-DD-HHMMSS.manual.bak --force
+```
+
+The `backup_db()`, `list_backups()`, and `restore_db()` functions are also exposed in `db.py` for use from application code or tests.
+
+### Test/development isolation
+
+To avoid touching production data while testing or experimenting, run the app against a separate database path:
+
+```bash
+STUDY_TRACKER_DB=/tmp/test_study_tracker.db streamlit run app.py
+```
+
+Or from Python:
+
+```python
+from db import get_test_db_path
+import os
+
+os.environ["STUDY_TRACKER_DB"] = str(get_test_db_path())
+```
 
 ---
 
@@ -164,7 +209,7 @@ This project is designed to be a personal, locally-run Streamlit app that anyone
 - The full Streamlit app source code (`app.py`, `db.py`, the `pages/` folder).
 - A `requirements.txt` file listing Python dependencies.
 - This spec document.
-- A `.gitignore` that excludes the SQLite database (`study_tracker.db`) and any Python/IDE artifacts.
+- A `.gitignore` that excludes the SQLite database (`study_tracker.db`), the `backups/` directory, and any Python/IDE artifacts.
 
 The SQLite database file is generated locally on first run, so each user has their own private data.
 
@@ -189,6 +234,7 @@ The SQLite database file is generated locally on first run, so each user has the
 
 ### Files that should stay out of the repository
 - `study_tracker.db` — personal SQLite database, created at runtime.
+- `backups/` — local database backups.
 - Any `.env` or local configuration files.
 - IDE and cache folders (e.g. `__pycache__/`, `.venv/`, `.idea/`).
 
