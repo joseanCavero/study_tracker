@@ -73,6 +73,23 @@ def restore_db(backup_path: Union[str, Path], force: bool = False) -> Path:
     return DB_PATH
 
 
+def _migrate_study_sessions():
+    """Add reinforcement-related columns/indexes to existing StudySessions table."""
+    with get_connection() as conn:
+        columns = [row[1] for row in conn.execute("PRAGMA table_info(StudySessions)").fetchall()]
+        if "type" not in columns:
+            conn.execute(
+                "ALTER TABLE StudySessions ADD COLUMN type TEXT NOT NULL DEFAULT 'study'"
+            )
+        if "reinforcement_session_id" not in columns:
+            conn.execute(
+                "ALTER TABLE StudySessions ADD COLUMN reinforcement_session_id INTEGER"
+            )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sessions_reinforcement ON StudySessions(reinforcement_session_id)"
+        )
+
+
 def init_db():
     with get_connection() as conn:
         conn.executescript(
@@ -97,20 +114,45 @@ def init_db():
                 FOREIGN KEY (area_id) REFERENCES AreasOfKnowledge(id)
             );
 
+            CREATE TABLE IF NOT EXISTS ReinforcementSessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                date DATE NOT NULL,
+                hours REAL NOT NULL,
+                note TEXT,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
             CREATE TABLE IF NOT EXISTS StudySessions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 resource_id INTEGER NOT NULL,
                 date DATE NOT NULL,
                 hours REAL NOT NULL,
                 note TEXT,
-                FOREIGN KEY (resource_id) REFERENCES Resources(id) ON DELETE CASCADE
+                type TEXT NOT NULL DEFAULT 'study',
+                reinforcement_session_id INTEGER,
+                FOREIGN KEY (resource_id) REFERENCES Resources(id) ON DELETE CASCADE,
+                FOREIGN KEY (reinforcement_session_id) REFERENCES ReinforcementSessions(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS ReinforcementPoints (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                resource_id INTEGER NOT NULL,
+                description TEXT NOT NULL,
+                completion_date DATE NOT NULL,
+                session_id INTEGER,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (resource_id) REFERENCES Resources(id) ON DELETE CASCADE,
+                FOREIGN KEY (session_id) REFERENCES ReinforcementSessions(id) ON DELETE CASCADE
             );
 
             CREATE INDEX IF NOT EXISTS idx_resources_area ON Resources(area_id);
             CREATE INDEX IF NOT EXISTS idx_sessions_resource ON StudySessions(resource_id);
             CREATE INDEX IF NOT EXISTS idx_sessions_date ON StudySessions(date);
+            CREATE INDEX IF NOT EXISTS idx_reinforcement_points_resource ON ReinforcementPoints(resource_id);
+            CREATE INDEX IF NOT EXISTS idx_reinforcement_points_session ON ReinforcementPoints(session_id);
             """
         )
+    _migrate_study_sessions()
 
 
 # -----------------------------------------------------------------------------
@@ -300,6 +342,175 @@ def get_resource_last_studied(resource_id: int):
             "SELECT MAX(date) FROM StudySessions WHERE resource_id = ?", (resource_id,)
         ).fetchone()
         return row[0]
+
+
+# -----------------------------------------------------------------------------
+# Reinforcement Points & Sessions
+# -----------------------------------------------------------------------------
+
+def _compute_point_status(point: dict) -> str:
+    if point.get("session_id"):
+        return "Complete"
+    completion_date = point["completion_date"]
+    if isinstance(completion_date, str):
+        completion_date = date.fromisoformat(completion_date)
+    today = date.today()
+    if completion_date < today:
+        return "Overdue"
+    return "On track"
+
+
+def create_reinforcement_point(resource_id: int, description: str, completion_date: date):
+    with get_connection() as conn:
+        cur = conn.execute(
+            "INSERT INTO ReinforcementPoints (resource_id, description, completion_date) VALUES (?, ?, ?)",
+            (resource_id, description, completion_date),
+        )
+        return cur.lastrowid
+
+
+def get_reinforcement_points(include_completed: bool = False):
+    query = """
+        SELECT rp.*, r.name as resource_name, a.name as area_name
+        FROM ReinforcementPoints rp
+        JOIN Resources r ON rp.resource_id = r.id
+        JOIN AreasOfKnowledge a ON r.area_id = a.id
+    """
+    if not include_completed:
+        query += " WHERE rp.session_id IS NULL"
+    query += " ORDER BY rp.created_at"
+
+    with get_connection() as conn:
+        rows = conn.execute(query).fetchall()
+        points = [dict(row) for row in rows]
+        for p in points:
+            p["status"] = _compute_point_status(p)
+        return points
+
+
+def get_reinforcement_point(point_id: int):
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT rp.*, r.name as resource_name, a.name as area_name
+            FROM ReinforcementPoints rp
+            JOIN Resources r ON rp.resource_id = r.id
+            JOIN AreasOfKnowledge a ON r.area_id = a.id
+            WHERE rp.id = ?
+            """,
+            (point_id,),
+        ).fetchone()
+        if not row:
+            return None
+        point = dict(row)
+        point["status"] = _compute_point_status(point)
+        return point
+
+
+def update_reinforcement_point(point_id: int, description: str, completion_date: date):
+    with get_connection() as conn:
+        conn.execute(
+            """
+            UPDATE ReinforcementPoints
+            SET description = ?, completion_date = ?
+            WHERE id = ? AND session_id IS NULL
+            """,
+            (description, completion_date, point_id),
+        )
+
+
+def delete_reinforcement_point(point_id: int):
+    with get_connection() as conn:
+        conn.execute(
+            "DELETE FROM ReinforcementPoints WHERE id = ? AND session_id IS NULL",
+            (point_id,),
+        )
+
+
+def create_reinforcement_session(point_ids: list, hours: float, note: str = ""):
+    if not point_ids:
+        raise ValueError("At least one reinforcement point is required")
+    if hours <= 0:
+        raise ValueError("Hours must be greater than 0")
+
+    today = date.today()
+    per_point_hours = hours / len(point_ids)
+
+    with get_connection() as conn:
+        cur = conn.execute(
+            "INSERT INTO ReinforcementSessions (date, hours, note) VALUES (?, ?, ?)",
+            (today, hours, note),
+        )
+        session_id = cur.lastrowid
+
+        for point_id in point_ids:
+            row = conn.execute(
+                "SELECT resource_id FROM ReinforcementPoints WHERE id = ? AND session_id IS NULL",
+                (point_id,),
+            ).fetchone()
+            if not row:
+                raise ValueError(f"Point {point_id} not found or already completed")
+            resource_id = row["resource_id"]
+
+            conn.execute(
+                """
+                INSERT INTO StudySessions
+                (resource_id, date, hours, note, type, reinforcement_session_id)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (resource_id, today, per_point_hours, note, "reinforcement", session_id),
+            )
+            conn.execute(
+                "UPDATE ReinforcementPoints SET session_id = ? WHERE id = ?",
+                (session_id, point_id),
+            )
+        return session_id
+
+
+def get_reinforcement_sessions(limit: int = 20):
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT rs.*, COUNT(rp.id) as point_count
+            FROM ReinforcementSessions rs
+            LEFT JOIN ReinforcementPoints rp ON rs.id = rp.session_id
+            GROUP BY rs.id
+            ORDER BY rs.date DESC, rs.id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def get_reinforcement_session_points(session_id: int):
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT rp.*, r.name as resource_name
+            FROM ReinforcementPoints rp
+            JOIN Resources r ON rp.resource_id = r.id
+            WHERE rp.session_id = ?
+            """,
+            (session_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def delete_reinforcement_session(session_id: int):
+    with get_connection() as conn:
+        conn.execute(
+            "DELETE FROM StudySessions WHERE reinforcement_session_id = ?",
+            (session_id,),
+        )
+        conn.execute(
+            "DELETE FROM ReinforcementPoints WHERE session_id = ?",
+            (session_id,),
+        )
+        conn.execute(
+            "DELETE FROM ReinforcementSessions WHERE id = ?",
+            (session_id,),
+        )
 
 
 # -----------------------------------------------------------------------------

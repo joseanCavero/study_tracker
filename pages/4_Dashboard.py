@@ -102,7 +102,10 @@ else:
         with st.container(border=True):
             col1, col2 = st.columns([4, 1])
             with col1:
-                st.markdown(f"**{s['date']}** — {s['hours']:.1f} h on *{s['resource_name']}*")
+                badge = "🔄 " if s.get("type") == "reinforcement" else ""
+                st.markdown(
+                    f"**{s['date']}** — {badge}{s['hours']:.1f} h on *{s['resource_name']}*"
+                )
                 if s["note"]:
                     st.caption(s["note"])
             with col2:
