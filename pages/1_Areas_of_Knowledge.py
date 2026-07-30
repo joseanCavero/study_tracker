@@ -85,8 +85,8 @@ if selected_area_id:
     progress = min(total_hours / goal, 1.0) if goal > 0 else 0
     st.progress(progress, text=f"{total_hours:.1f} / {goal:.0f} hours ({progress*100:.1f}%)")
 
-    tab_edit, tab_resources, tab_add_resource, tab_delete = st.tabs(
-        ["Edit area", "Resources in this area", "Add resource", "Delete area"]
+    tab_resources, tab_add_resource, tab_edit, tab_delete = st.tabs(
+        ["Resources in this area", "Add resource", "Edit area", "Delete area"]
     )
 
     with tab_edit:

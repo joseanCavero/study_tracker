@@ -112,8 +112,8 @@ if selected_resource_id:
         f"Last studied: **{last_studied}**."
     )
 
-    tab_log, tab_sessions, tab_edit, tab_delete = st.tabs(
-        ["Log hours", "Session history", "Edit resource", "Delete resource"]
+    tab_sessions, tab_log, tab_edit, tab_delete = st.tabs(
+        ["Session history","Log hours", "Edit resource", "Delete resource"]
     )
 
     with tab_log:
