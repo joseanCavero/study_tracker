@@ -1,5 +1,6 @@
 import argparse
 import os
+import re
 import shutil
 import sqlite3
 from datetime import datetime, date, timedelta
@@ -11,7 +12,7 @@ DB_PATH = Path(
 )
 BACKUPS_DIR = Path(__file__).parent / "backups"
 
-RESOURCE_TYPES = ["book", "course", "video", "article", "other"]
+RESOURCE_TYPES = ["book", "course", "video", "article", "claude project", "other"]
 RESOURCE_STATUSES = ["not started", "in progress", "completed"]
 
 
@@ -90,7 +91,77 @@ def _migrate_study_sessions():
         )
 
 
+def _migrate_resources():
+    """Migrate Resources table to update the CHECK constraint for type dynamically."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='Resources'"
+        ).fetchone()
+        if not row:
+            return  # Table doesn't exist yet, init_db will create it
+        
+        sql = row[0]
+        # Find CHECK(type IN (...))
+        match = re.search(r"CHECK\(\s*type\s+IN\s*\(([^)]+)\)\s*\)", sql, re.IGNORECASE)
+        if not match:
+            return
+            
+        existing_types = [t.strip().strip("'\"") for t in match.group(1).split(",")]
+        
+        # If the set of types is different, migrate the table.
+        if set(existing_types) != set(RESOURCE_TYPES):
+            # We need to migrate. Build the new CHECK constraint.
+            types_list_str = ", ".join(f"'{t}'" for t in RESOURCE_TYPES)
+            
+            conn.execute("PRAGMA foreign_keys = OFF")
+            try:
+                conn.execute("BEGIN TRANSACTION")
+                
+                # 1. Rename existing table
+                conn.execute("ALTER TABLE Resources RENAME TO Resources_old")
+                
+                # 2. Create the new table
+                conn.execute(
+                    f"""
+                    CREATE TABLE Resources (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name TEXT NOT NULL,
+                        area_id INTEGER NOT NULL,
+                        type TEXT NOT NULL CHECK(type IN ({types_list_str})),
+                        status TEXT NOT NULL CHECK(status IN ('not started', 'in progress', 'completed')),
+                        author TEXT,
+                        notes TEXT,
+                        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        FOREIGN KEY (area_id) REFERENCES AreasOfKnowledge(id)
+                    )
+                    """
+                )
+                
+                # 3. Copy data from old to new
+                conn.execute(
+                    """
+                    INSERT INTO Resources (id, name, area_id, type, status, author, notes, created_at)
+                    SELECT id, name, area_id, type, status, author, notes, created_at
+                    FROM Resources_old
+                    """
+                )
+                
+                # 4. Drop the old table
+                conn.execute("DROP TABLE Resources_old")
+                
+                # 5. Re-create index
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_resources_area ON Resources(area_id)")
+                
+                conn.execute("COMMIT")
+            except Exception as e:
+                conn.execute("ROLLBACK")
+                raise e
+            finally:
+                conn.execute("PRAGMA foreign_keys = ON")
+
+
 def init_db():
+    _migrate_resources()
     with get_connection() as conn:
         conn.executescript(
             """
@@ -106,7 +177,7 @@ def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
                 area_id INTEGER NOT NULL,
-                type TEXT NOT NULL CHECK(type IN ('book', 'course', 'video', 'article', 'other')),
+                type TEXT NOT NULL CHECK(type IN ('book', 'course', 'video', 'article', 'claude project','other')),
                 status TEXT NOT NULL CHECK(status IN ('not started', 'in progress', 'completed')),
                 author TEXT,
                 notes TEXT,
