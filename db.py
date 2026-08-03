@@ -91,36 +91,82 @@ def _migrate_study_sessions():
         )
 
 
+def _get_column_names(conn, table_name):
+    """Return the column names for a table."""
+    return [row[1] for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()]
+
+
 def _migrate_resources():
-    """Migrate Resources table to update the CHECK constraint for type dynamically."""
+    """Migrate Resources table to update the CHECK constraint for type dynamically.
+
+    SQLite does not rewrite foreign-key references when a table is renamed, so
+    tables that reference Resources (StudySessions, ReinforcementPoints) must be
+    recreated during the migration. The function also recovers from prior failed
+    or incomplete migrations that may have left Resources_old behind or left
+    stale references pointing to it.
+    """
     with get_connection() as conn:
-        row = conn.execute(
+        tables = {
+            row[0] for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+
+        # Recovery: a previous migration left the temporary table behind.
+        if "Resources_old" in tables and "Resources" in tables:
+            conn.execute("DROP TABLE Resources_old")
+            tables.discard("Resources_old")
+
+        # Recovery: a previous migration failed after renaming Resources.
+        if "Resources_old" in tables and "Resources" not in tables:
+            conn.execute("ALTER TABLE Resources_old RENAME TO Resources")
+            tables.discard("Resources_old")
+            tables.add("Resources")
+
+        if "Resources" not in tables:
+            return  # Table doesn't exist yet, init_db will create it.
+
+        sql = conn.execute(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='Resources'"
-        ).fetchone()
-        if not row:
-            return  # Table doesn't exist yet, init_db will create it
-        
-        sql = row[0]
-        # Find CHECK(type IN (...))
-        match = re.search(r"CHECK\(\s*type\s+IN\s*\(([^)]+)\)\s*\)", sql, re.IGNORECASE)
-        if not match:
+        ).fetchone()[0]
+
+        # Determine whether the Resources CHECK constraint needs updating.
+        match = re.search(
+            r"CHECK\(\s*type\s+IN\s*\(([^)]+)\)\s*\)", sql, re.IGNORECASE
+        )
+        existing_types = (
+            [t.strip().strip("'\"") for t in match.group(1).split(",")]
+            if match else []
+        )
+        needs_type_migration = set(existing_types) != set(RESOURCE_TYPES)
+
+        # Determine whether foreign-key references are stale (e.g. a previous
+        # migration dropped Resources_old but left referencing tables pointing to it).
+        stale_fks = False
+        for table in ("StudySessions", "ReinforcementPoints"):
+            if table not in tables:
+                continue
+            table_sql = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+                (table,),
+            ).fetchone()[0]
+            if "Resources_old" in table_sql:
+                stale_fks = True
+                break
+
+        if not needs_type_migration and not stale_fks:
             return
-            
-        existing_types = [t.strip().strip("'\"") for t in match.group(1).split(",")]
-        
-        # If the set of types is different, migrate the table.
-        if set(existing_types) != set(RESOURCE_TYPES):
-            # We need to migrate. Build the new CHECK constraint.
-            types_list_str = ", ".join(f"'{t}'" for t in RESOURCE_TYPES)
-            
-            conn.execute("PRAGMA foreign_keys = OFF")
-            try:
-                conn.execute("BEGIN TRANSACTION")
-                
-                # 1. Rename existing table
+
+        types_list_str = ", ".join(f"'{t}'" for t in RESOURCE_TYPES)
+
+        conn.execute("PRAGMA foreign_keys = OFF")
+        try:
+            conn.execute("BEGIN TRANSACTION")
+
+            # 1. Rename existing Resources table if we need to rebuild it.
+            if needs_type_migration:
                 conn.execute("ALTER TABLE Resources RENAME TO Resources_old")
-                
-                # 2. Create the new table
+
                 conn.execute(
                     f"""
                     CREATE TABLE Resources (
@@ -136,8 +182,7 @@ def _migrate_resources():
                     )
                     """
                 )
-                
-                # 3. Copy data from old to new
+
                 conn.execute(
                     """
                     INSERT INTO Resources (id, name, area_id, type, status, author, notes, created_at)
@@ -145,19 +190,101 @@ def _migrate_resources():
                     FROM Resources_old
                     """
                 )
-                
-                # 4. Drop the old table
+
+            # Recreate StudySessions so its FK references point to Resources.
+            if "StudySessions" in tables:
+                conn.execute("ALTER TABLE StudySessions RENAME TO StudySessions_old")
+                conn.execute(
+                    """
+                    CREATE TABLE StudySessions (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        resource_id INTEGER NOT NULL,
+                        date DATE NOT NULL,
+                        hours REAL NOT NULL,
+                        note TEXT,
+                        type TEXT NOT NULL DEFAULT 'study',
+                        reinforcement_session_id INTEGER,
+                        FOREIGN KEY (resource_id) REFERENCES Resources(id) ON DELETE CASCADE,
+                        FOREIGN KEY (reinforcement_session_id) REFERENCES ReinforcementSessions(id) ON DELETE CASCADE
+                    )
+                    """
+                )
+                old_columns = set(_get_column_names(conn, "StudySessions_old"))
+                new_columns = [
+                    "id", "resource_id", "date", "hours", "note", "type",
+                    "reinforcement_session_id",
+                ]
+                common_columns = [c for c in new_columns if c in old_columns]
+                columns = ", ".join(common_columns)
+                conn.execute(
+                    f"""
+                    INSERT INTO StudySessions ({columns})
+                    SELECT {columns}
+                    FROM StudySessions_old
+                    """
+                )
+                conn.execute("DROP TABLE StudySessions_old")
+
+            # Recreate ReinforcementPoints so its FK references point to Resources.
+            if "ReinforcementPoints" in tables:
+                conn.execute(
+                    "ALTER TABLE ReinforcementPoints RENAME TO ReinforcementPoints_old"
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE ReinforcementPoints (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        resource_id INTEGER NOT NULL,
+                        description TEXT NOT NULL,
+                        completion_date DATE NOT NULL,
+                        session_id INTEGER,
+                        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        FOREIGN KEY (resource_id) REFERENCES Resources(id) ON DELETE CASCADE,
+                        FOREIGN KEY (session_id) REFERENCES ReinforcementSessions(id) ON DELETE CASCADE
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO ReinforcementPoints
+                        (id, resource_id, description, completion_date, session_id, created_at)
+                    SELECT
+                        id, resource_id, description, completion_date, session_id, created_at
+                    FROM ReinforcementPoints_old
+                    """
+                )
+                conn.execute("DROP TABLE ReinforcementPoints_old")
+
+            # 4. Drop the old Resources table.
+            if needs_type_migration:
                 conn.execute("DROP TABLE Resources_old")
-                
-                # 5. Re-create index
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_resources_area ON Resources(area_id)")
-                
-                conn.execute("COMMIT")
-            except Exception as e:
-                conn.execute("ROLLBACK")
-                raise e
-            finally:
-                conn.execute("PRAGMA foreign_keys = ON")
+
+            # 5. Re-create indexes.
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_resources_area ON Resources(area_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sessions_resource ON StudySessions(resource_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sessions_date ON StudySessions(date)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sessions_reinforcement ON StudySessions(reinforcement_session_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_reinforcement_points_resource ON ReinforcementPoints(resource_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_reinforcement_points_session ON ReinforcementPoints(session_id)"
+            )
+
+            conn.execute("COMMIT")
+        except Exception as e:
+            conn.execute("ROLLBACK")
+            raise e
+        finally:
+            conn.execute("PRAGMA foreign_keys = ON")
 
 
 def init_db():
